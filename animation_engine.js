@@ -1,727 +1,655 @@
 /**
- * IK Attachment — Blockbench Plugin
- * Constraint-based bone attachment system with keyframe baking.
+ * BB Physics — Blockbench Plugin
+ * Gravity simulation for animation bones.
  *
- * How it works:
- *   1. Define that bone A ("slave") follows bone B ("master") with a captured offset.
- *   2. Add Attach / Detach events at specific timeline positions.
- *   3. Live preview shows the constraint during animation playback.
- *   4. "Bake" writes real position/rotation keyframes to the slave bone.
+ * Right-click any folder/bone in the Outliner → "Gravity..."
+ * Set direction (X/Y/Z sliders), force (Benchions), time range.
+ * Click OK → two timeline markers placed, keyframes baked.
  */
 (function () {
   'use strict';
 
-  const PLUGIN_ID      = 'ik_attachment';
-  const PLUGIN_VERSION = '0.2.0';
-  const DATA_KEY       = '__ik_attachment__';
-  const INST_KEY       = '__ik_attachment_plugin_instance__';
+  const PLUGIN_ID      = 'bb_physics';
+  const PLUGIN_VERSION = '1.0.0';
+  const INST_KEY       = '__bb_physics_instance__';
 
-  // ============================================================
-  // Singleton guard — safe reload / hot-reload
-  // ============================================================
-  try {
-    const prev = globalThis?.[INST_KEY];
-    if (prev?.cleanup) prev.cleanup();
-  } catch (_) {}
+  // ── Singleton guard ───────────────────────────────────────────
+  try { const p = globalThis?.[INST_KEY]; if (p?.cleanup) p.cleanup(); } catch (_) {}
 
-  // ============================================================
-  // Per-animation data model
-  // ============================================================
-  //
-  //  anim[DATA_KEY] = {
-  //    constraints: {
-  //      [slaveBoneUuid]: {
-  //        masterBoneUuid : string,
-  //        slaveName      : string,
-  //        masterName     : string,
-  //        offsetMatrix   : number[16]   // slave-in-master-local space (Matrix4 elements)
-  //      }
-  //    },
-  //    events: {
-  //      [slaveBoneUuid]: Array<{ time: number, attached: boolean }>
-  //    }
-  //  }
+  // ═══════════════════════════════════════════════════════════════
+  // Physics helpers
+  // ═══════════════════════════════════════════════════════════════
 
-  function getAnimData(anim) {
-    if (!anim) return null;
-    if (!anim[DATA_KEY]) {
-      anim[DATA_KEY] = { constraints: {}, events: {} };
+  /**
+   * Rotate the default "down" gravity vector (0,-1,0)
+   * by the user-provided Euler angles (degrees, XYZ order).
+   */
+  function computeGravityDir(rx, ry, rz) {
+    const v = new THREE.Vector3(0, -1, 0);
+    const euler = new THREE.Euler(
+      THREE.MathUtils.degToRad(rx),
+      THREE.MathUtils.degToRad(ry),
+      THREE.MathUtils.degToRad(rz),
+      'XYZ'
+    );
+    v.applyEuler(euler);
+    return { x: v.x, y: v.y, z: v.z };
+  }
+
+  /** Collect a group and ALL its Group descendants (depth-first). */
+  function collectGroupChain(root) {
+    const chain = [root];
+    function walk(g) {
+      for (const child of (g.children || [])) {
+        if (child instanceof Group) { chain.push(child); walk(child); }
+      }
     }
-    return anim[DATA_KEY];
+    walk(root);
+    return chain;
   }
 
   /**
-   * Returns whether the constraint for slaveBoneUuid is active at `time`.
-   * If no events are defined the constraint is always active.
+   * Simulate spring-damper gravity for ONE bone and write rotation keyframes.
+   *
+   * Model: bone is a rigid rod attached at its origin.
+   * Gravity creates a torque; we solve the damped-spring ODE numerically.
+   *
+   *   θ'' + 2ζω θ' + ω² θ = ω² · target
+   *
+   * Each bone in a chain runs this independently in its own local space.
+   * The hierarchy naturally composes the motions → chain / rope effect.
    */
-  function isConstraintActive(anim, slaveUuid, time) {
-    const data = getAnimData(anim);
-    if (!data?.constraints?.[slaveUuid]) return false;
-    const evs = [...(data.events?.[slaveUuid] ?? [])].sort((a, b) => a.time - b.time);
-    if (!evs.length) return true;        // always on — no toggles yet
-    let state = true;
-    for (const ev of evs) {
-      if (ev.time <= time + 1e-5) state = ev.attached;
-      else break;
+  function simulateBone(anim, bone, gravDir, benchions, startTime, endTime) {
+    const snapping = anim.snapping || 20;
+    const dt       = 1 / snapping;
+    const frames   = Math.max(1, Math.round((endTime - startTime) / dt));
+
+    // ── Target equilibrium rotation ─────────────────────────────
+    // Maps gravity direction components to bone rotation axes.
+    //  · downward gravity (-Y) → +X tilt (bone droops "forward/down")
+    //  · sideways gravity (+X) → +Z tilt
+    //  · forward gravity (+Z) → -X tilt
+    const maxAngle = 18 + (benchions - 1) * 8; // °  (18° @ b=1, 90° @ b=10)
+    const targetX  = -gravDir.y * maxAngle;
+    const targetZ  =  gravDir.x * maxAngle;
+    const targetY  =  gravDir.z * maxAngle * 0.3; // minor twist
+
+    // ── Spring-damper coefficients ──────────────────────────────
+    // omega: stiffer (higher benchions) = snappier response
+    const omega  = 2.5 + benchions * 0.75;  // rad/s  (natural frequency)
+    const zeta   = 0.65;                     // damping ratio – slightly underdamped
+    const omega2 = omega * omega;
+    const twoZW  = 2 * zeta * omega;
+
+    let posX = 0, velX = 0;
+    let posY = 0, velY = 0;
+    let posZ = 0, velZ = 0;
+
+    // ── Ensure bone has an animator ─────────────────────────────
+    if (!anim.animators[bone.uuid]) {
+      anim.animators[bone.uuid] = new BoneAnimator(bone.uuid, anim, bone.name);
     }
-    return state;
-  }
+    const animator = anim.animators[bone.uuid];
 
-  // ============================================================
-  // Small helpers
-  // ============================================================
+    // ── Frame loop ──────────────────────────────────────────────
+    const SUB = 4; // sub-steps per frame (stability for high omega)
+    const subDt = dt / SUB;
 
-  const getAnim   = ()  => { try { return Animation?.selected ?? null; } catch (_) { return null; } };
-  const getTimeSec = () => { try { return Number(Timeline?.time) || 0; } catch (_) { return 0; }   };
-  const getGroup  = (uuid) => Group.all.find(g => g.uuid === uuid) ?? null;
+    for (let i = 0; i <= frames; i++) {
+      const t = +(startTime + i * dt).toFixed(6);
 
-  function getWorldMat(group) {
-    if (!group?.mesh) return new THREE.Matrix4();
-    group.mesh.updateWorldMatrix(true, false);
-    return group.mesh.matrixWorld.clone();
-  }
-
-  function getParentInvWorldMat(group) {
-    if (group?.parent instanceof Group && group.parent.mesh) {
-      group.parent.mesh.updateWorldMatrix(true, false);
-      return group.parent.mesh.matrixWorld.clone().invert();
-    }
-    return new THREE.Matrix4(); // identity → world = local
-  }
-
-  // ============================================================
-  // Offset capture
-  //   offset = master^-1 × slave  (slave expressed in master's local space)
-  // ============================================================
-  function captureOffset(slaveGroup, masterGroup) {
-    const masterInv = getWorldMat(masterGroup).invert();
-    const offset    = masterInv.multiply(getWorldMat(slaveGroup));
-    return Array.from(offset.elements);
-  }
-
-  // ============================================================
-  // Apply constraint to the slave mesh in the Three.js scene
-  // ============================================================
-
-  // Track which slaves had matrixAutoUpdate disabled so we can restore them.
-  const _autoUpdateDisabled = new Set();
-
-  function applyConstraintToMesh(slaveGroup, masterGroup, offsetElements) {
-    if (!slaveGroup?.mesh || !masterGroup?.mesh) return;
-
-    masterGroup.mesh.updateWorldMatrix(true, false);
-    const masterWorld = masterGroup.mesh.matrixWorld.clone();
-
-    const offsetMat = new THREE.Matrix4();
-    offsetMat.elements.set(offsetElements);
-
-    // target world = master × offset
-    const targetWorld = masterWorld.multiply(offsetMat);
-
-    // convert to slave parent-local space
-    const localMat = getParentInvWorldMat(slaveGroup).multiply(targetWorld);
-
-    slaveGroup.mesh.matrixAutoUpdate = false;
-    _autoUpdateDisabled.add(slaveGroup.uuid);
-
-    slaveGroup.mesh.matrix.copy(localMat);
-    localMat.decompose(
-      slaveGroup.mesh.position,
-      slaveGroup.mesh.quaternion,
-      slaveGroup.mesh.scale
-    );
-    slaveGroup.mesh.updateWorldMatrix(false, true);
-  }
-
-  function releaseConstraintOnMesh(slaveGroup) {
-    if (!slaveGroup?.mesh) return;
-    slaveGroup.mesh.matrixAutoUpdate = true;
-    _autoUpdateDisabled.delete(slaveGroup.uuid);
-  }
-
-  // ============================================================
-  // Render-frame hook — live preview of constraints
-  // ============================================================
-
-  let _prevActiveSet = new Set();
-
-  function onRenderFrame() {
-    const anim = getAnim();
-    const data = anim ? getAnimData(anim) : null;
-
-    if (!anim || !data?.constraints || !Animator?.open) {
-      // Release everything
-      _prevActiveSet.forEach(uuid => {
-        const g = getGroup(uuid);
-        if (g) releaseConstraintOnMesh(g);
-      });
-      _prevActiveSet.clear();
-      return;
-    }
-
-    const time      = getTimeSec();
-    const nowActive = new Set();
-
-    for (const [slaveUuid, constraint] of Object.entries(data.constraints)) {
-      if (!isConstraintActive(anim, slaveUuid, time)) {
-        // Was active last frame → release
-        if (_prevActiveSet.has(slaveUuid)) {
-          const g = getGroup(slaveUuid);
-          if (g) releaseConstraintOnMesh(g);
+      if (i > 0) {
+        for (let s = 0; s < SUB; s++) {
+          const aX = omega2 * (targetX - posX) - twoZW * velX;
+          const aY = omega2 * (targetY - posY) - twoZW * velY;
+          const aZ = omega2 * (targetZ - posZ) - twoZW * velZ;
+          velX += aX * subDt;  posX += velX * subDt;
+          velY += aY * subDt;  posY += velY * subDt;
+          velZ += aZ * subDt;  posZ += velZ * subDt;
         }
-        continue;
       }
 
-      nowActive.add(slaveUuid);
-      const slave  = getGroup(slaveUuid);
-      const master = getGroup(constraint.masterBoneUuid);
-      if (slave && master) {
-        applyConstraintToMesh(slave, master, constraint.offsetMatrix);
-      }
+      animator.addKeyframe({
+        channel      : 'rotation',
+        time         : t,
+        interpolation: 'linear',
+        data_points  : [{ x: +posX.toFixed(5), y: +posY.toFixed(5), z: +posZ.toFixed(5) }],
+      });
     }
-
-    // Release constraints that were active but no longer are
-    for (const uuid of _prevActiveSet) {
-      if (!nowActive.has(uuid)) {
-        const g = getGroup(uuid);
-        if (g) releaseConstraintOnMesh(g);
-      }
-    }
-
-    _prevActiveSet = nowActive;
   }
 
-  // ============================================================
-  // Bake constraints → position + rotation keyframes
-  // ============================================================
+  // ═══════════════════════════════════════════════════════════════
+  // Marker helpers
+  // ═══════════════════════════════════════════════════════════════
 
-  function bakeConstraints(anim) {
-    if (!anim) { Blockbench.showQuickMessage('No animation selected'); return; }
+  const MARKER_COLOR = 6; // orange in Blockbench's palette
 
-    const data = getAnimData(anim);
-    if (!data || !Object.keys(data.constraints).length) {
-      Blockbench.showQuickMessage('No constraints to bake');
-      return;
-    }
+  function placeGravityMarkers(anim, rootBoneName, startTime, endTime) {
+    if (!Array.isArray(anim.markers)) anim.markers = [];
 
-    const snapping  = anim.snapping || 20;
-    const duration  = anim.length   || 1;
-    const step      = 1 / snapping;
-    const frames    = Math.round(duration / step);
+    // Remove previous gravity markers for this bone
+    const tag = `⬆ Gravity[${rootBoneName}]`;
+    anim.markers = anim.markers.filter(m => !String(m.name || '').startsWith(tag));
 
-    const origTime  = Timeline.time;
-    const collected = {}; // { slaveUuid: [{time, pos:[x,y,z], rot:[x,y,z]}] }
-
-    // ── sampling loop ────────────────────────────────────────
-    for (const [slaveUuid, constraint] of Object.entries(data.constraints)) {
-      const slave  = getGroup(slaveUuid);
-      const master = getGroup(constraint.masterBoneUuid);
-      if (!slave || !master) continue;
-
-      collected[slaveUuid] = [];
-
-      for (let i = 0; i <= frames; i++) {
-        const time = Math.round(i * step * 10000) / 10000;
-        if (!isConstraintActive(anim, slaveUuid, time)) continue;
-
-        // Seek & update scene
-        Timeline.time = time;
-        Animator.preview();
-
-        // Compute constrained local matrix (same math as applyConstraintToMesh)
-        master.mesh.updateWorldMatrix(true, false);
-        const masterWorld = master.mesh.matrixWorld.clone();
-
-        const offsetMat = new THREE.Matrix4();
-        offsetMat.elements.set(constraint.offsetMatrix);
-
-        const targetWorld = masterWorld.multiply(offsetMat);
-        const localMat    = getParentInvWorldMat(slave).multiply(targetWorld);
-
-        const localPos  = new THREE.Vector3();
-        const localQuat = new THREE.Quaternion();
-        const localScl  = new THREE.Vector3();
-        localMat.decompose(localPos, localQuat, localScl);
-
-        // Euler ZYX — matches Blockbench/Bedrock rotation convention
-        const euler = new THREE.Euler().setFromQuaternion(localQuat, 'ZYX');
-
-        // ── coordinate conversion ─────────────────────────────
-        // In Blockbench (4.x), 1 BB unit = 1 Three.js unit.
-        // Three.js local position of a bone = bone.origin + keyframe_position_offset
-        // → keyframe_pos = localPos - bone.origin
-        const kfPos = [
-          localPos.x - slave.origin[0],
-          localPos.y - slave.origin[1],
-          localPos.z - slave.origin[2],
-        ];
-        const kfRot = [
-          THREE.MathUtils.radToDeg(euler.x),
-          THREE.MathUtils.radToDeg(euler.y),
-          THREE.MathUtils.radToDeg(euler.z),
-        ];
-
-        collected[slaveUuid].push({ time, pos: kfPos, rot: kfRot });
+    const makeMarker = (time, label) => {
+      // Try the constructor first (newer BB), fall back to plain object
+      try {
+        return new TimelineMarker({ time, color: MARKER_COLOR, name: label });
+      } catch (_) {
+        return { time, color: MARKER_COLOR, name: label };
       }
-    }
+    };
 
-    // Restore original time
-    Timeline.time = origTime;
-    Animator.preview();
+    anim.markers.push(makeMarker(startTime, `${tag} ▶`));
+    anim.markers.push(makeMarker(endTime,   `${tag} ■`));
+  }
 
-    // ── write keyframes ──────────────────────────────────────
-    let totalKf = 0;
+  // ═══════════════════════════════════════════════════════════════
+  // Main entry: apply gravity and bake keyframes
+  // ═══════════════════════════════════════════════════════════════
+
+  function applyGravity({ boneUuid, rotX, rotY, rotZ, benchions, startTime, endTime }) {
+    const anim = Animation?.selected;
+    if (!anim) { Blockbench.showQuickMessage('Select an animation first'); return; }
+
+    const root = Group.all.find(g => g.uuid === boneUuid);
+    if (!root) { Blockbench.showQuickMessage('Bone not found'); return; }
+
+    if (endTime <= startTime) { Blockbench.showQuickMessage('End time must be after start time'); return; }
+
+    const gravDir    = computeGravityDir(rotX, rotY, rotZ);
+    const boneChain  = collectGroupChain(root);
+
     Undo.initEdit({ animations: [anim] });
 
-    for (const [slaveUuid, framelist] of Object.entries(collected)) {
-      if (!framelist.length) continue;
+    boneChain.forEach(bone => {
+      simulateBone(anim, bone, gravDir, +benchions, +startTime, +endTime);
+    });
 
-      // Ensure bone animator exists
-      if (!anim.animators[slaveUuid]) {
-        const g = getGroup(slaveUuid);
-        if (!g) continue;
-        anim.animators[slaveUuid] = new BoneAnimator(slaveUuid, anim, g.name);
-      }
+    placeGravityMarkers(anim, root.name, +startTime, +endTime);
 
-      const animator = anim.animators[slaveUuid];
-      if (!animator) continue;
-
-      for (const f of framelist) {
-        animator.addKeyframe({
-          channel      : 'position',
-          time         : f.time,
-          interpolation: 'linear',
-          data_points  : [{ x: f.pos[0], y: f.pos[1], z: f.pos[2] }],
-        });
-        animator.addKeyframe({
-          channel      : 'rotation',
-          time         : f.time,
-          interpolation: 'linear',
-          data_points  : [{ x: f.rot[0], y: f.rot[1], z: f.rot[2] }],
-        });
-        totalKf++;
-      }
-    }
-
-    Undo.finishEdit('Bake IK Attachments');
+    Undo.finishEdit('BB Physics – Apply Gravity');
     Animator.preview();
-    Blockbench.showQuickMessage(`✓ Baked ${totalKf} keyframe pairs`);
+
+    // Refresh timeline markers display
+    try { Timeline.vue?.$forceUpdate?.(); } catch (_) {}
+
+    Blockbench.showQuickMessage(
+      `✓ Gravity applied to ${root.name}${boneChain.length > 1 ? ` + ${boneChain.length - 1} child bone(s)` : ''}`
+    );
   }
 
-  // ============================================================
-  // Persistence — save/load constraint data with the project
-  // ============================================================
+  // ═══════════════════════════════════════════════════════════════
+  // Styles
+  // ═══════════════════════════════════════════════════════════════
 
-  function onProjectSave() {
-    try {
-      if (!Project) return;
-      const store = {};
-      (Animation.all || []).forEach(anim => {
-        const d = anim[DATA_KEY];
-        if (!d) return;
-        const hasData =
-          Object.keys(d.constraints || {}).length ||
-          Object.keys(d.events || {}).length;
-        if (hasData) store[anim.uuid] = d;
-      });
-      if (!Project.meta) Project.meta = {};
-      Project.meta[DATA_KEY] = store;
-    } catch (_) {}
-  }
+  const STYLE_ID = 'bb_physics_style';
 
-  function onProjectLoad() {
-    try {
-      const store = Project?.meta?.[DATA_KEY];
-      if (!store) return;
-      (Animation.all || []).forEach(anim => {
-        const saved = store[anim.uuid];
-        if (saved) anim[DATA_KEY] = saved;
-      });
-    } catch (_) {}
-  }
-
-  // ============================================================
-  // Panel dialog (Vue-based)
-  // ============================================================
-
-  let _dialog = null;
-
-  // CSS injected once
-  const STYLE_ID = 'ik_attachment_style';
   function ensureStyle() {
     if (document.getElementById(STYLE_ID)) return;
     const s = document.createElement('style');
-    s.id = s.textContent = '';
     s.id = STYLE_ID;
     s.textContent = `
-      #ik_attachment_dialog .dialog_content { margin: 0; }
-      #ik_attachment_dialog .ika-wrap { padding: 16px 18px; font-size: 13px; }
-      #ik_attachment_dialog .ika-section {
+      #bb_physics_gravity_dialog .dialog_content { margin: 0; }
+
+      #bb_physics_gravity_dialog .phys-wrap {
+        padding: 0;
+        font-size: 13px;
+        display: flex;
+        flex-direction: column;
+        gap: 0;
+      }
+
+      /* ── header strip ── */
+      #bb_physics_gravity_dialog .phys-header {
+        background: var(--color-accent);
+        color: var(--color-accent_text, #fff);
+        padding: 12px 18px;
+        font-size: 0.9em;
+        opacity: 0.9;
+      }
+
+      /* ── content area ── */
+      #bb_physics_gravity_dialog .phys-body {
+        padding: 16px 18px;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
+
+      /* ── section card ── */
+      #bb_physics_gravity_dialog .phys-card {
         border: 1px solid var(--color-border);
         background: var(--color-back);
-        margin-bottom: 14px;
       }
-      #ik_attachment_dialog .ika-section-head {
-        display: flex; align-items: center; gap: 8px;
-        padding: 9px 12px;
+      #bb_physics_gravity_dialog .phys-card-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
         border-bottom: 1px solid var(--color-border);
         font-weight: 700;
+        font-size: 0.9em;
+        letter-spacing: 0.03em;
+        text-transform: uppercase;
       }
-      #ik_attachment_dialog .ika-section-body { padding: 10px 12px; }
-      #ik_attachment_dialog .ika-row {
-        display: flex; align-items: center; gap: 10px; margin-bottom: 8px;
+      #bb_physics_gravity_dialog .phys-card-body {
+        padding: 12px 14px;
       }
-      #ik_attachment_dialog .ika-row label { flex: 0 0 90px; opacity: 0.8; }
-      #ik_attachment_dialog .ika-row select { flex: 1; }
-      #ik_attachment_dialog .ika-hint { font-size: 0.82em; opacity: 0.6; margin-bottom: 10px; }
-      #ik_attachment_dialog .ika-btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
-      #ik_attachment_dialog .ika-event-list { margin-top: 6px; }
-      #ik_attachment_dialog .ika-event-item {
-        display: flex; align-items: center; font-size: 0.83em;
-        margin-bottom: 3px; gap: 8px;
+
+      /* ── row ── */
+      #bb_physics_gravity_dialog .phys-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 8px;
       }
-      #ik_attachment_dialog .ika-event-time { width: 60px; opacity: 0.75; }
-      #ik_attachment_dialog .ika-attach-label  { color: var(--color-accent); }
-      #ik_attachment_dialog .ika-detach-label  { color: #e77; }
-      #ik_attachment_dialog .ika-spacer { flex: 1; }
-      #ik_attachment_dialog .ika-footer { border-top: 1px solid var(--color-border); padding-top: 12px; margin-top: 4px; }
-      #ik_attachment_dialog .ika-bake-btn { width: 100%; padding: 9px 0; font-size: 1em; font-weight: 700; }
-      #ik_attachment_dialog .ika-empty { opacity: 0.6; text-align: center; padding: 18px 0; }
+      #bb_physics_gravity_dialog .phys-row:last-child { margin-bottom: 0; }
+      #bb_physics_gravity_dialog .phys-label {
+        width: 18px;
+        font-weight: 700;
+        text-align: center;
+        font-size: 0.88em;
+      }
+      #bb_physics_gravity_dialog .phys-label.x { color: #e06; }
+      #bb_physics_gravity_dialog .phys-label.y { color: #0b5; }
+      #bb_physics_gravity_dialog .phys-label.z { color: #39f; }
+      #bb_physics_gravity_dialog .phys-range { flex: 1; accent-color: var(--color-accent); }
+      #bb_physics_gravity_dialog .phys-val {
+        width: 46px;
+        text-align: right;
+        font-size: 0.85em;
+        opacity: 0.8;
+        font-variant-numeric: tabular-nums;
+      }
+
+      /* ── direction badge ── */
+      #bb_physics_gravity_dialog .phys-dir-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        background: var(--color-dark);
+        border: 1px solid var(--color-border);
+        padding: 4px 10px;
+        font-size: 0.82em;
+        margin-top: 10px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      /* ── benchions meter ── */
+      #bb_physics_gravity_dialog .phys-bench-labels {
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.75em;
+        opacity: 0.55;
+        margin-top: 4px;
+      }
+
+      /* ── time inputs ── */
+      #bb_physics_gravity_dialog .phys-time-row {
+        display: flex;
+        gap: 12px;
+      }
+      #bb_physics_gravity_dialog .phys-time-field {
+        flex: 1;
+      }
+      #bb_physics_gravity_dialog .phys-time-field label {
+        display: block;
+        font-size: 0.8em;
+        opacity: 0.65;
+        margin-bottom: 4px;
+      }
+      #bb_physics_gravity_dialog .phys-time-field input {
+        width: 100%;
+      }
+
+      /* ── hint text ── */
+      #bb_physics_gravity_dialog .phys-hint {
+        font-size: 0.8em;
+        opacity: 0.55;
+        margin-top: 6px;
+      }
+
+      /* ── bone select ── */
+      #bb_physics_gravity_dialog .phys-bone-select {
+        width: 100%;
+      }
+
+      /* ── footer ── */
+      #bb_physics_gravity_dialog .phys-footer {
+        border-top: 1px solid var(--color-border);
+        padding: 10px 18px;
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+      }
     `.trim();
     document.head.appendChild(s);
   }
 
-  function showPanel() {
-    ensureStyle();
-    if (_dialog) { try { _dialog.show(); return; } catch (_) { _dialog = null; } }
+  // ═══════════════════════════════════════════════════════════════
+  // Dialog
+  // ═══════════════════════════════════════════════════════════════
 
-    _dialog = new Dialog({
-      id     : 'ik_attachment_dialog',
-      title  : '🔗 IK Attachment',
-      width  : 520,
-      buttons: [],
+  function showGravityDialog(clickedGroup) {
+    ensureStyle();
+
+    const anim    = Animation?.selected;
+    const curTime = +(Number(Timeline?.time) || 0).toFixed(3);
+    const animLen = +(anim?.length || 2).toFixed(3);
+
+    new Dialog({
+      id      : 'bb_physics_gravity_dialog',
+      title   : '🌍 Gravity',
+      width   : 480,
+      buttons : [],           // custom buttons inside the template
       component: {
         data() {
-          return this.buildState();
+          return {
+            boneList  : (Group.all || []).map(g => ({ uuid: g.uuid, name: g.name })),
+            boneUuid  : clickedGroup?.uuid || (Group.all[0]?.uuid ?? ''),
+
+            rotX      : 0,
+            rotY      : 0,
+            rotZ      : 0,
+            benchions : 1.0,
+
+            startTime : curTime,
+            endTime   : Math.min(curTime + 1.0, animLen),
+          };
+        },
+        computed: {
+          gravDir() {
+            return computeGravityDir(this.rotX, this.rotY, this.rotZ);
+          },
+          gravLabel() {
+            const d   = this.gravDir;
+            const ax  = Math.abs(d.x), ay = Math.abs(d.y), az = Math.abs(d.z);
+            const max = Math.max(ax, ay, az);
+            if (max < 0.05)  return '— neutral (no pull)';
+            if (ay >= max)   return d.y < 0 ? '⬇ Downward'  : '⬆ Upward';
+            if (ax >= max)   return d.x < 0 ? '⬅ Leftward'  : '➡ Rightward';
+            return              d.z < 0 ? '↙ Forward'  : '↗ Backward';
+          },
+          gravVec() {
+            const d = this.gravDir;
+            return `(${d.x.toFixed(2)}, ${d.y.toFixed(2)}, ${d.z.toFixed(2)})`;
+          },
+          benchLabel() {
+            const b = this.benchions;
+            if (b < 2)  return 'Light drift';
+            if (b < 4)  return 'Gentle sway';
+            if (b < 6)  return 'Normal gravity';
+            if (b < 8)  return 'Heavy pull';
+            return              'Extreme force';
+          },
+          selectedBoneName() {
+            const b = (Group.all || []).find(g => g.uuid === this.boneUuid);
+            return b?.name ?? '—';
+          },
         },
         methods: {
-          buildState() {
-            const anim = getAnim();
-            const d    = anim ? getAnimData(anim) : null;
-            return {
-              hasAnim     : !!anim,
-              animName    : anim?.name ?? '',
-              constraints : d ? { ...d.constraints }                         : {},
-              events      : d ? Object.fromEntries(
-                              Object.entries(d.events ?? {}).map(([k, v]) => [k, [...v]])
-                            ) : {},
-              boneList    : (Group.all || []).map(g => ({ uuid: g.uuid, name: g.name })),
-              newSlave    : '',
-              newMaster   : '',
-              curTime     : getTimeSec(),
-            };
+          confirm() {
+            const { boneUuid, rotX, rotY, rotZ, benchions, startTime, endTime } = this;
+            // close dialog then apply (avoids Vue teardown issues)
+            try { this.$el.closest('dialog')?.__vue__?.close?.(); } catch (_) {}
+            try { document.querySelector('#bb_physics_gravity_dialog')?.closest('dialog')?.close?.(); } catch(_) {}
+            // BB Dialog close
+            try {
+              const dlgs = [...document.querySelectorAll('.dialog')];
+              dlgs.forEach(d => {
+                if (d.id === 'bb_physics_gravity_dialog') {
+                  // dispatch Escape to close it, then apply
+                }
+              });
+            } catch(_) {}
+
+            applyGravity({ boneUuid, rotX, rotY, rotZ, benchions, startTime, endTime });
+
+            // Close the dialog the BB way
+            setTimeout(() => {
+              try {
+                const dlg = document.getElementById('bb_physics_gravity_dialog');
+                if (dlg) {
+                  const closeBtn = dlg.querySelector('.dialog_close_button');
+                  if (closeBtn) closeBtn.click();
+                }
+              } catch (_) {}
+            }, 0);
           },
-
-          refresh() {
-            const s = this.buildState();
-            Object.assign(this.$data, s);
-          },
-
-          // ── Add constraint ─────────────────────────────────
-          addConstraint() {
-            const { newSlave, newMaster } = this;
-            if (!newSlave || !newMaster) {
-              Blockbench.showQuickMessage('Select both slave and master bones'); return;
-            }
-            if (newSlave === newMaster) {
-              Blockbench.showQuickMessage('Slave and master must be different'); return;
-            }
-            const anim = getAnim();
-            if (!anim) return;
-            const sg = getGroup(newSlave);
-            const mg = getGroup(newMaster);
-            if (!sg || !mg) { Blockbench.showQuickMessage('Bone not found'); return; }
-
-            const data = getAnimData(anim);
-            data.constraints[newSlave] = {
-              masterBoneUuid: newMaster,
-              slaveName     : sg.name,
-              masterName    : mg.name,
-              offsetMatrix  : captureOffset(sg, mg),
-            };
-            if (!data.events[newSlave]) data.events[newSlave] = [];
-
-            this.refresh();
-            Blockbench.showQuickMessage(`✓ ${sg.name} → ${mg.name}`);
-          },
-
-          // ── Remove constraint ──────────────────────────────
-          removeConstraint(uuid) {
-            const anim = getAnim();
-            if (!anim) return;
-            const data = getAnimData(anim);
-            const g = getGroup(uuid);
-            if (g) releaseConstraintOnMesh(g);
-            delete data.constraints[uuid];
-            delete data.events[uuid];
-            this.refresh();
-          },
-
-          // ── Re-capture offset at current timeline position ─
-          recapture(uuid) {
-            const anim = getAnim();
-            if (!anim) return;
-            const data = getAnimData(anim);
-            const c  = data.constraints[uuid];
-            const sg = c && getGroup(uuid);
-            const mg = c && getGroup(c.masterBoneUuid);
-            if (sg && mg) {
-              c.offsetMatrix = captureOffset(sg, mg);
-              Blockbench.showQuickMessage('✓ Offset recaptured');
-            }
-          },
-
-          // ── Add attach / detach event ──────────────────────
-          addEvent(uuid, attached) {
-            const anim = getAnim();
-            if (!anim) return;
-            const data = getAnimData(anim);
-            const time = getTimeSec();
-            const evs  = (data.events[uuid] || []).filter(e => Math.abs(e.time - time) > 1e-5);
-            evs.push({ time, attached });
-            evs.sort((a, b) => a.time - b.time);
-            data.events[uuid] = evs;
-            this.refresh();
-          },
-
-          // ── Remove a single event ──────────────────────────
-          removeEvent(uuid, time) {
-            const anim = getAnim();
-            if (!anim) return;
-            const data = getAnimData(anim);
-            data.events[uuid] = (data.events[uuid] || []).filter(e => Math.abs(e.time - time) > 1e-5);
-            this.refresh();
-          },
-
-          // ── Clear all events for a constraint ──────────────
-          clearEvents(uuid) {
-            const anim = getAnim();
-            if (!anim) return;
-            getAnimData(anim).events[uuid] = [];
-            this.refresh();
-          },
-
-          // ── Bake ───────────────────────────────────────────
-          doBake() { bakeConstraints(getAnim()); },
-
-          eventsFor(uuid) {
-            return [...(this.events[uuid] ?? [])].sort((a, b) => a.time - b.time);
+          cancel() {
+            setTimeout(() => {
+              try {
+                const dlg = document.getElementById('bb_physics_gravity_dialog');
+                if (dlg) {
+                  const closeBtn = dlg.querySelector('.dialog_close_button');
+                  if (closeBtn) closeBtn.click();
+                }
+              } catch (_) {}
+            }, 0);
           },
         },
-
-        computed: {
-          constraintList() {
-            return Object.entries(this.constraints).map(([uuid, c]) => ({
-              uuid,
-              slaveName : c.slaveName  ?? uuid,
-              masterName: c.masterName ?? c.masterBoneUuid,
-            }));
-          },
-        },
-
-        mounted() {
-          this._t = setInterval(() => {
-            const t    = getTimeSec();
-            const name = getAnim()?.name ?? '';
-            if (t !== this.curTime) this.curTime = t;
-            if (name !== this.animName) this.refresh();
-          }, 100);
-        },
-
-        beforeDestroy() { clearInterval(this._t); },
-
         template: `
-<div class="ika-wrap">
+<div class="phys-wrap">
 
-  <div v-if="!hasAnim" class="ika-empty">
-    Open the Animate tab and select an animation.
+  <!-- header -->
+  <div class="phys-header">
+    Bakes rotation keyframes that simulate gravity between two timeline markers.
+    All child bones inside the selected folder are affected.
   </div>
 
-  <template v-else>
+  <div class="phys-body">
 
-    <!-- animation label -->
-    <div style="margin-bottom:12px; opacity:0.65; font-size:0.9em;">
-      Animation: <strong>{{ animName }}</strong>
-    </div>
-
-    <!-- ── Add constraint ─────────────────────────────────── -->
-    <div class="ika-section">
-      <div class="ika-section-head">➕ Add Constraint</div>
-      <div class="ika-section-body">
-        <div class="ika-row">
-          <label>Slave bone</label>
-          <select v-model="newSlave" class="tool">
-            <option value="">— select —</option>
-            <option v-for="b in boneList" :key="b.uuid" :value="b.uuid">{{ b.name }}</option>
-          </select>
+    <!-- ── Bone selector ─────────────────────────────────────── -->
+    <div class="phys-card">
+      <div class="phys-card-head">🦴 Target Bone / Folder</div>
+      <div class="phys-card-body">
+        <select class="tool phys-bone-select" v-model="boneUuid">
+          <option v-for="b in boneList" :key="b.uuid" :value="b.uuid">{{ b.name }}</option>
+        </select>
+        <div class="phys-hint">
+          Gravity will be applied to <strong>{{ selectedBoneName }}</strong>
+          and every bone nested inside it.
         </div>
-        <div class="ika-row">
-          <label>Follows</label>
-          <select v-model="newMaster" class="tool">
-            <option value="">— select —</option>
-            <option v-for="b in boneList" :key="b.uuid" :value="b.uuid">{{ b.name }}</option>
-          </select>
-        </div>
-        <div class="ika-hint">
-          Seek the timeline to the moment where the relative position looks correct,
-          then click below to capture the offset.
-        </div>
-        <button class="tool" @click="addConstraint" :disabled="!newSlave || !newMaster">
-          🔗 Add Constraint (capture offset now)
-        </button>
       </div>
     </div>
 
-    <!-- ── Empty state ────────────────────────────────────── -->
-    <div v-if="!constraintList.length" class="ika-empty">
-      No constraints defined for this animation.
-    </div>
+    <!-- ── Gravity direction ──────────────────────────────────── -->
+    <div class="phys-card">
+      <div class="phys-card-head">🧭 Gravity Direction</div>
+      <div class="phys-card-body">
 
-    <!-- ── Constraint cards ───────────────────────────────── -->
-    <div v-for="c in constraintList" :key="c.uuid" class="ika-section">
-
-      <div class="ika-section-head">
-        <span>{{ c.slaveName }}</span>
-        <span style="opacity:0.5; font-weight:400;">→</span>
-        <span>{{ c.masterName }}</span>
-        <div class="ika-spacer"></div>
-        <button class="tool" title="Re-capture offset at current timeline position"
-                @click="recapture(c.uuid)">📐 Re-capture</button>
-        <button class="tool" style="margin-left:4px;"
-                @click="removeConstraint(c.uuid)">🗑</button>
-      </div>
-
-      <div class="ika-section-body">
-        <div class="ika-hint">Current time: {{ curTime.toFixed(3) }}s</div>
-
-        <div class="ika-btn-row">
-          <button class="tool" @click="addEvent(c.uuid, true)">
-            🔗 Attach @ {{ curTime.toFixed(3) }}s
-          </button>
-          <button class="tool" @click="addEvent(c.uuid, false)">
-            ✂️ Detach @ {{ curTime.toFixed(3) }}s
-          </button>
-          <button class="tool" @click="clearEvents(c.uuid)">🧹 Clear</button>
+        <div class="phys-hint" style="margin-bottom:10px;">
+          Rotate the gravity vector from its default (straight down).
+          Leave all sliders at 0 for normal downward gravity.
         </div>
 
-        <!-- event list -->
-        <div v-if="eventsFor(c.uuid).length" class="ika-event-list">
-          <div style="font-size:0.82em; opacity:0.55; margin-bottom:4px;">Timeline events:</div>
-          <div v-for="ev in eventsFor(c.uuid)" :key="ev.time" class="ika-event-item">
-            <span class="ika-event-time">{{ ev.time.toFixed(3) }}s</span>
-            <span :class="ev.attached ? 'ika-attach-label' : 'ika-detach-label'">
-              {{ ev.attached ? '🔗 Attach' : '✂️ Detach' }}
-            </span>
-            <div class="ika-spacer"></div>
-            <button class="tool" style="padding:1px 7px; font-size:0.8em;"
-                    @click="removeEvent(c.uuid, ev.time)">✕</button>
+        <div class="phys-row">
+          <span class="phys-label x">X</span>
+          <input class="phys-range" type="range" v-model.number="rotX" min="-180" max="180" step="1" />
+          <span class="phys-val">{{ rotX }}°</span>
+        </div>
+        <div class="phys-row">
+          <span class="phys-label y">Y</span>
+          <input class="phys-range" type="range" v-model.number="rotY" min="-180" max="180" step="1" />
+          <span class="phys-val">{{ rotY }}°</span>
+        </div>
+        <div class="phys-row">
+          <span class="phys-label z">Z</span>
+          <input class="phys-range" type="range" v-model.number="rotZ" min="-180" max="180" step="1" />
+          <span class="phys-val">{{ rotZ }}°</span>
+        </div>
+
+        <div class="phys-dir-badge">
+          <span>{{ gravLabel }}</span>
+          <span style="opacity:0.45;">{{ gravVec }}</span>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ── Benchions ─────────────────────────────────────────── -->
+    <div class="phys-card">
+      <div class="phys-card-head">⚖ Force — Benchions</div>
+      <div class="phys-card-body">
+        <div class="phys-row" style="margin-bottom:2px;">
+          <input class="phys-range" type="range" v-model.number="benchions" min="0.1" max="10" step="0.1" />
+          <span class="phys-val" style="width:60px;">{{ benchions.toFixed(1) }} ⚖</span>
+        </div>
+        <div class="phys-bench-labels">
+          <span>0.1 — feather</span>
+          <span style="color:var(--color-accent);">{{ benchLabel }}</span>
+          <span>10 — extreme</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Time range ─────────────────────────────────────────── -->
+    <div class="phys-card">
+      <div class="phys-card-head">⏱ Time Range (seconds)</div>
+      <div class="phys-card-body">
+        <div class="phys-time-row">
+          <div class="phys-time-field">
+            <label>⬆ Gravity starts at</label>
+            <input type="number" class="tool" v-model.number="startTime" min="0" step="0.05" />
+          </div>
+          <div class="phys-time-field">
+            <label>■ Gravity ends at</label>
+            <input type="number" class="tool" v-model.number="endTime" :min="startTime + 0.05" step="0.05" />
           </div>
         </div>
-        <div v-else class="ika-hint" style="margin-bottom:0;">
-          No events → constraint is always active for the full animation.
+        <div class="phys-hint">
+          Two timeline markers will be placed at these positions.
+          Keyframes are generated at the animation's snapping rate between them.
         </div>
       </div>
     </div>
 
-    <!-- ── Bake ──────────────────────────────────────────── -->
-    <div v-if="constraintList.length" class="ika-footer">
-      <button class="tool ika-bake-btn" @click="doBake">
-        ⚙️ Bake Attachments → Keyframes
-      </button>
-      <div class="ika-hint" style="margin-top:8px; margin-bottom:0;">
-        Writes linear position/rotation keyframes to the slave bone for every constrained frame
-        (at the animation's snapping rate). Constraints are <em>not</em> removed after baking —
-        delete them manually when you are done.
-      </div>
-    </div>
+  </div><!-- /phys-body -->
 
-  </template>
+  <!-- ── Footer buttons ──────────────────────────────────────── -->
+  <div class="phys-footer">
+    <button class="tool" @click="cancel">Cancel</button>
+    <button class="tool"
+            @click="confirm"
+            :disabled="!boneUuid || endTime <= startTime"
+            style="background:var(--color-accent); color:var(--color-accent_text, #fff); font-weight:700; padding:0 18px;">
+      ✓ Apply Gravity
+    </button>
+  </div>
+
 </div>
         `,
       },
-    });
-
-    _dialog.show();
+    }).show();
   }
 
-  // ============================================================
-  // Cleanup
-  // ============================================================
+  // ═══════════════════════════════════════════════════════════════
+  // Hook into Group right-click context menu
+  // ═══════════════════════════════════════════════════════════════
 
-  let _actions = [];
+  let _gravityAction = null;
+  let _menuBarAction = null;
+
+  function buildGravityAction() {
+    _gravityAction = new Action('bb_physics_gravity_action', {
+      name       : 'Gravity…',
+      icon       : 'south',
+      description: 'Add gravity physics simulation to this bone and its children',
+      condition  : () => !!(Animation?.selected),
+      click() {
+        // When called from right-click, Group.selected should be set
+        const clicked =
+          (Array.isArray(selected) ? selected.find(s => s instanceof Group) : null)
+          ?? (selected instanceof Group ? selected : null)
+          ?? Group.all[0]
+          ?? null;
+        showGravityDialog(clicked);
+      },
+    });
+  }
+
+  function hookGroupMenu() {
+    if (!_gravityAction) buildGravityAction();
+
+    // Primary: Group prototype menu (Blockbench 4.x)
+    try {
+      if (Group.prototype?.menu?.addAction) {
+        Group.prototype.menu.addAction(_gravityAction, 'physics');
+        return true;
+      }
+    } catch (_) {}
+
+    // Fallback: Outliner context menu (some builds)
+    try {
+      if (typeof Outliner !== 'undefined' && Outliner.control_menu?.addAction) {
+        Outliner.control_menu.addAction(_gravityAction);
+        return true;
+      }
+    } catch (_) {}
+
+    return false;
+  }
+
+  function unhookGroupMenu() {
+    if (!_gravityAction) return;
+    try { Group.prototype?.menu?.removeAction?.(_gravityAction); } catch (_) {}
+    try { Outliner?.control_menu?.removeAction?.(_gravityAction); } catch (_) {}
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // Cleanup
+  // ═══════════════════════════════════════════════════════════════
 
   function cleanup() {
-    try { Blockbench.removeListener('render_frame', onRenderFrame); }  catch (_) {}
-    try { Blockbench.removeListener('save_project',  onProjectSave); }  catch (_) {}
-    try { Blockbench.removeListener('select_project', onProjectLoad); } catch (_) {}
-
-    _autoUpdateDisabled.forEach(uuid => {
-      const g = getGroup(uuid);
-      if (g) releaseConstraintOnMesh(g);
-    });
-    _autoUpdateDisabled.clear();
-    _prevActiveSet.clear();
-
-    _actions.forEach(a => { try { a?.delete(); } catch (_) {} });
-    _actions = [];
-
-    try { _dialog?.hide(); } catch (_) {}
-    _dialog = null;
-
+    unhookGroupMenu();
+    try { _gravityAction?.delete(); }  catch (_) {}
+    try { _menuBarAction?.delete(); }  catch (_) {}
     try { document.getElementById(STYLE_ID)?.remove(); } catch (_) {}
+    _gravityAction = null;
+    _menuBarAction = null;
   }
 
   try { globalThis[INST_KEY] = { cleanup }; } catch (_) {}
 
-  // ============================================================
+  // ═══════════════════════════════════════════════════════════════
   // Plugin registration
-  // ============================================================
+  // ═══════════════════════════════════════════════════════════════
 
   Plugin.register(PLUGIN_ID, {
-    title      : 'IK Attachment',
+    title      : 'BB Physics',
     author     : 'Community',
-    description: 'Attach bones to each other during animation with toggleable constraints. '
-               + 'Preview live, then bake to position/rotation keyframes.',
-    icon       : 'link',
+    description: 'Gravity physics simulation for Blockbench animations. '
+               + 'Right-click any bone/folder in the Outliner → Gravity…',
+    icon       : 'south',
     version    : PLUGIN_VERSION,
     min_version: '4.8.0',
     variant    : 'both',
 
     onload() {
-      cleanup(); // defensive double-load guard
+      cleanup();
+      buildGravityAction();
 
-      Blockbench.on('render_frame',  onRenderFrame);
-      Blockbench.on('save_project',  onProjectSave);
-      Blockbench.on('select_project', onProjectLoad);
+      // Hook into right-click menu
+      hookGroupMenu();
 
-      const panelAction = new Action('ik_attachment_open', {
-        name       : 'IK Attachment Panel',
-        description: 'Open the IK Attachment constraint panel',
-        icon       : 'link',
-        click      : showPanel,
+      // Animation menu fallback (always visible)
+      _menuBarAction = new Action('bb_physics_open_from_menu', {
+        name       : 'Add Gravity to Bone…',
+        icon       : 'south',
+        description: 'Open the gravity physics dialog for the selected bone',
+        condition  : () => !!(Animation?.selected),
+        click() {
+          const bone =
+            (Array.isArray(selected) ? selected.find(s => s instanceof Group) : null)
+            ?? (selected instanceof Group ? selected : null)
+            ?? Group.all[0]
+            ?? null;
+          showGravityDialog(bone);
+        },
       });
 
-      const bakeAction = new Action('ik_attachment_bake', {
-        name       : 'Bake IK Attachments',
-        description: 'Convert active attachment constraints to position/rotation keyframes',
-        icon       : 'archive',
-        condition  : () => !!getAnim(),
-        click      : () => bakeConstraints(getAnim()),
-      });
-
-      _actions = [panelAction, bakeAction];
-      MenuBar.addAction(panelAction, 'animation');
-      MenuBar.addAction(bakeAction,  'animation');
+      MenuBar.addAction(_menuBarAction, 'animation');
     },
 
     onunload: cleanup,
